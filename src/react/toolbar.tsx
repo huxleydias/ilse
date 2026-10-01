@@ -25,7 +25,8 @@ import { captureElement, captureTextSelection, captureArea, captureEnvironment, 
 import { analyzeElement, scanPage, setDSTokens, getDSTokens, parseTokensJSON, type Suggestion, type PageIssue } from './analyze.js';
 import { connect, disconnect, send, onMessage, onStatus, isConnected } from './ws-client.js';
 import { useImageInput, InlineAttachments } from './image-input.js';
-import { PropertyPanel, type PanelHistory } from './property-panel.js';
+import { PropertyPanel, type PanelHistory, type TextEdit } from './property-panel.js';
+import { useFrontLayer } from './front-layer.js';
 import { SketchLayer, PencilControl, PEN_COLORS } from './sketch-layer.js';
 import { analyzeSketch, renderSketchImage, formatSketchNote, type Stroke } from './sketch.js';
 import { beginDrag, beginResize, settleElement, expireElement, formatReorder, formatReparent, reorderUnit, componentScope, type LiveDrag } from './live-layout.js';
@@ -106,11 +107,17 @@ interface AutoContext {
   area?: string;
   move?: string;
   resize?: string;
+  /** Remove the element: what the agent reads, and the chip's text */
+  remove?: string;
+  removeLabel?: string;
+  /** Text retyped in the panel: what the agent reads, and the chip's text */
+  text?: string;
+  textLabel?: string;
 }
 
 /** The note as the agent receives it: the designer's words first, then Ilse's context. */
 function composeNote(note: string, auto?: AutoContext): string {
-  const blocks = auto ? [auto.reorder, auto.move, auto.resize, auto.area, auto.style, auto.sketch].filter(Boolean) as string[] : [];
+  const blocks = auto ? [auto.remove, auto.text, auto.reorder, auto.move, auto.resize, auto.area, auto.style, auto.sketch].filter(Boolean) as string[] : [];
   return [note.trim(), ...blocks].filter(Boolean).join('\n\n');
 }
 
@@ -139,7 +146,7 @@ function reconcileSent(drafts: AnnotationDraft[], known: Array<{ id: string; sta
  * One line per thing Ilse will tell the agent — shown in the card so the
  * designer sees how it read the gesture, while the note stays theirs.
  */
-type AutoKey = 'reorder' | 'move' | 'resize' | 'style' | 'sketch' | 'area';
+type AutoKey = 'remove' | 'text' | 'reorder' | 'move' | 'resize' | 'style' | 'sketch' | 'area';
 interface AutoLine { key: AutoKey; text: string }
 
 function autoSummary(auto?: AutoContext): AutoLine[] {
@@ -147,6 +154,8 @@ function autoSummary(auto?: AutoContext): AutoLine[] {
   const out: AutoLine[] = [];
   const push = (key: AutoKey, text: string) => out.push({ key, text });
   const count = (text: string, re: RegExp) => (text.match(re) ?? []).length;
+  if (auto.removeLabel) push('remove', auto.removeLabel);
+  if (auto.textLabel) push('text', auto.textLabel);
   if (auto.reorderLabel) push('reorder', auto.reorderLabel);
   if (auto.move) push('move', `${auto.move.replace(/\.$/, '')}`);
   if (auto.resize) push('resize', `${auto.resize.replace(/\.$/, '')}`);
@@ -160,6 +169,19 @@ function autoSummary(auto?: AutoContext): AutoLine[] {
   }
   if (auto.area) push('area', `${auto.area.split(':')[0]}`);
   return out;
+}
+
+/** The command for a retyped text: the chip, and what the agent is told */
+function textCommand(edit?: { from: string; to: string }): Pick<AutoContext, 'text' | 'textLabel'> {
+  if (!edit) return { text: undefined, textLabel: undefined };
+  const short = (x: string) => x.length > 28 ? `${x.slice(0, 27)}…` : x;
+  return {
+    textLabel: `${t('toolbar.textCommand')} “${short(edit.to.trim() || '∅')}”`,
+    text: [
+      `Trocar o texto deste elemento de ${JSON.stringify(edit.from)} para ${JSON.stringify(edit.to)}.`,
+      'Se o texto vem de uma variável, prop, tradução (i18n) ou dados de lista, troque na origem — só este texto, respeitando o Scope.',
+    ].join('\n'),
+  };
 }
 
 const hasAuto = (auto?: AutoContext) => !!auto && Object.values(auto).some(Boolean);
@@ -265,6 +287,7 @@ interface AnnotationDraft {
   /** Pencil strokes (page coordinates) — shown on the page until the note is sent */
   sketch?: Stroke[];
   auto?: AutoContext;
+  textEdit?: TextEdit;
 }
 
 interface PopoverRect {
@@ -275,6 +298,8 @@ interface PopoverRect {
 }
 
 interface PendingCapture {
+  /** The element's text, retyped in the panel */
+  textEdit?: TextEdit;
   capture: ElementCapture;
   scope?: Scope;
   context: string;        // CSS selector (for grep/code)
@@ -383,18 +408,31 @@ function AnnotationEditor({
 
 // ─── AnnotationPopover ────────────────────────────────────────────────────────
 
-function computePopoverPos(rect: PopoverRect): { top: number; left: number } {
+function computePopoverPos(rect: PopoverRect, height = 168, width = 322): { top: number; left: number } {
   if (typeof window === 'undefined') return { top: rect.top, left: rect.left };
-  const width = 290;
-  const height = 168;
   const gap = 8;
-  let top = rect.top + rect.height + gap;
-  let left = rect.left;
-  if (left + width > window.innerWidth - 8) left = window.innerWidth - width - 8;
-  if (left < 8) left = 8;
-  if (top + height > window.innerHeight - 8) top = rect.top - height - gap;
-  if (top < 8) top = 8;
-  return { top, left };
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const clamp = (p: { top: number; left: number }) => ({
+    top: Math.max(8, Math.min(p.top, vh - height - 8)),
+    left: Math.max(8, Math.min(p.left, vw - width - 8)),
+  });
+  // The property panel is a window of its own: the card is placed around it,
+  // never on top of it (the designer can still drag one over the other)
+  const panel = document.querySelector('[data-ilse-panel]')?.getBoundingClientRect();
+  const hits = (p: { top: number; left: number }) => !!panel && p.left < panel.right + gap && p.left + width > panel.left - gap
+    && p.top < panel.bottom + gap && p.top + height > panel.top - gap;
+  const below = { top: rect.top + rect.height + gap, left: rect.left };
+  const above = { top: rect.top - height - gap, left: rect.left };
+  const candidates = [
+    below.top + height <= vh - 8 ? below : above,
+    below.top + height <= vh - 8 ? above : below,
+    ...(panel ? [
+      { top: below.top, left: panel.left - width - gap },
+      { top: above.top, left: panel.left - width - gap },
+      { top: rect.top, left: panel.left - width - gap },
+    ] : []),
+  ].map(clamp);
+  return candidates.find(p => !hits(p)) ?? candidates[0];
 }
 
 function AnnotationPopover({
@@ -439,10 +477,13 @@ function AnnotationPopover({
   const dragRef = useRef<{ startX: number; startY: number; origTop: number; origLeft: number } | null>(null);
   const noteFocusedRef = useRef(false);
 
-  // Re-compute on rect change — only when not being dragged
+  // Re-compute on rect change — only when not being dragged. After layout: the
+  // panel it steers around mounts in the same commit, and the card's own height is known.
+  const cardRef = useRef<HTMLDivElement | null>(null);
   useLayoutEffect(() => {
-    if (!dragRef.current) setPos(computePopoverPos(rect));
+    if (!dragRef.current) setPos(computePopoverPos(rect, cardRef.current?.offsetHeight || undefined, cardRef.current?.offsetWidth || undefined));
   }, [rect]);
+  const [front, bringToFront] = useFrontLayer('card', true);
 
   // Drag handlers
   useEffect(() => {
@@ -460,11 +501,13 @@ function AnnotationPopover({
 
   return (
     <div
+      ref={cardRef}
       data-ilse-toolbar
+      onMouseDownCapture={bringToFront}
       style={{
         position: 'fixed', top: pos.top, left: pos.left, width: 290,
         backgroundColor: color.popover, border: `1px solid ${color.border}`,
-        borderRadius: radius.xl, padding: 16, zIndex: 99999,
+        borderRadius: radius.xl, padding: 16, zIndex: front ? 99999 : 99998,
         boxShadow: shadow.xl,
         fontFamily: font.sans,
       }}
@@ -630,6 +673,7 @@ function AnnotationPopover({
           }}
           contentEditable
           role="textbox"
+          data-ilse-note=""
           suppressContentEditableWarning
           onInput={(e) => onNoteChange((e.target as HTMLDivElement).textContent ?? '')}
           onPaste={handlePaste}
@@ -1381,6 +1425,11 @@ export function IlseToolbar({ demoMode, demoEndpoint }: { demoMode?: boolean; de
   // Whether the current style preview should survive the panel unmounting.
   // Flipped on send, cleared on cancel and on every new capture.
   const stylePreviewCommitted = useRef(false);
+  /** Per element: how to undo the on-screen preview of a draft that was added but not sent */
+  const previewReverts = useRef(new Map<string, () => void>());
+  // A new selection starts uncommitted, whichever way it was made — else a
+  // cancel after an earlier send would leave this draft's preview on the page
+  useEffect(() => { if (pendingCapture?.pixelTargetId) stylePreviewCommitted.current = false; }, [pendingCapture?.pixelTargetId]);
   const [toolbarPos, setToolbarPos] = useState<{ x: number; y: number }>(() => getInitialToolbarPos());
 
   const [hoverLabel, setHoverLabel] = useState<string | null>(null);
@@ -1519,6 +1568,7 @@ export function IlseToolbar({ demoMode, demoEndpoint }: { demoMode?: boolean; de
         const draft = annotationsRef.current.find(d => d.id === a.id);
         if (draft?.styleData) setTimeout(() => clearStylePreview(draft), 600);
         if (draft?.pixelTargetId) expireElement(document.querySelector(`[data-ilse-pixel-target="${draft.pixelTargetId}"]`));
+        if (draft?.pixelTargetId) setTimeout(() => unhide(draft.pixelTargetId!), 4000); // still in the DOM = the code kept it
         setAnnotations(prev => prev.map(ann =>
           ann.id === a.id ? { ...ann, status: 'resolved' as const, resolvedSummary: a.resolvedSummary as string } : ann
         ));
@@ -1732,6 +1782,7 @@ export function IlseToolbar({ demoMode, demoEndpoint }: { demoMode?: boolean; de
       imageRefs: pendingCapture.imageRefs,
       ...(pendingCapture.sketch ? { sketch: pendingCapture.sketch } : {}),
       ...(pendingCapture.auto ? { auto: pendingCapture.auto } : {}),
+      ...(pendingCapture.textEdit ? { textEdit: pendingCapture.textEdit } : {}),
       ...(styleChanges.length > 0 ? {
         styleData: { selector: pendingCapture.capture.element, changes: styleChanges },
       } : {}),
@@ -1746,7 +1797,10 @@ export function IlseToolbar({ demoMode, demoEndpoint }: { demoMode?: boolean; de
       } : {}),
     }]);
     // Sent — leave the preview standing until the agent rewrites the source.
-    stylePreviewCommitted.current = styleChanges.length > 0;
+    stylePreviewCommitted.current = styleChanges.length > 0 || !!pendingCapture.textEdit;
+    // …but keep a way back: deleting this draft before it's sent undoes it on screen
+    const revert = panelHistoryRef.current?.detachPreview();
+    if (revert && pendingCapture.pixelTargetId) previewReverts.current.set(pendingCapture.pixelTargetId, revert);
     setPendingCapture(null);
     setAnnotating(true);
   }, [pendingCapture]);
@@ -1758,6 +1812,7 @@ export function IlseToolbar({ demoMode, demoEndpoint }: { demoMode?: boolean; de
     setLiveDragging(false);
     const pc = pendingCaptureRef.current;
     if (pc?.pixelTargetId) settleElement(document.querySelector(`[data-ilse-pixel-target="${pc.pixelTargetId}"]`));
+    if (pc?.pixelTargetId) unhide(pc.pixelTargetId);
     setPendingCapture(null);
     setAnnotating(true);
   }, []);
@@ -2039,14 +2094,8 @@ export function IlseToolbar({ demoMode, demoEndpoint }: { demoMode?: boolean; de
       if (e.key !== 'Escape') return;
       // Progressive close: dismiss the topmost layer first
       if (pendingCaptureForEsc.current) {
-        // Dropping the selection drops its live layout preview too
-        liveDragRef.current?.cancel();
-        liveDragRef.current = null;
-        setLiveDragging(false);
-        const id = pendingCaptureForEsc.current.pixelTargetId;
-        if (id) settleElement(document.querySelector(`[data-ilse-pixel-target="${id}"]`));
-        setPendingCapture(null);
-        setAnnotating(true); // stay in select mode
+        // Same as cancel: every preview of this draft goes, selection mode stays
+        cancelCapture();
         return;
       }
       if (chatOpenForEsc.current) {
@@ -2244,6 +2293,8 @@ export function IlseToolbar({ demoMode, demoEndpoint }: { demoMode?: boolean; de
       // What the designer typed, apart from Ilse's own context — the CLI must not skip it
       designerNote: ann.note.trim() || undefined,
       scope: ann.scope,
+      remove: ann.auto?.remove ? true : undefined,
+      textEdit: ann.textEdit,
       element: ann.capture.element,
       component: ann.capture.component,
       styles: ann.capture.styles,
@@ -2366,8 +2417,68 @@ export function IlseToolbar({ demoMode, demoEndpoint }: { demoMode?: boolean; de
     }
   }, [annotations, sendAnnotation]);
 
+  // ── Remove the selected element ──
+  // Preview: hidden in place (display:none on React's own node — never removed
+  // from the DOM, React owns it). The agent takes it out of the JSX; × or ⌘Z
+  // shows it again. Kept per pixel target, so the original display comes back.
+  const hiddenDisplay = useRef(new Map<string, string>());
+  const unhide = (id: string) => {
+    const saved = hiddenDisplay.current.get(id);
+    if (saved === undefined) return;
+    hiddenDisplay.current.delete(id);
+    const el = document.querySelector<HTMLElement>(`[data-ilse-pixel-target="${id}"]`);
+    if (el?.isConnected) el.style.display = saved;
+  };
+  const removeSelected = useCallback(() => {
+    const pc = pendingCaptureRef.current;
+    if (!pc?.pixelTargetId || pc.markerType !== 'element' || pc.auto?.remove) return;
+    const el = document.querySelector<HTMLElement>(`[data-ilse-pixel-target="${pc.pixelTargetId}"]`);
+    if (!el) return;
+    hiddenDisplay.current.set(pc.pixelTargetId, el.style.display);
+    el.style.display = 'none';
+    const what = pc.contextLabel;
+    setPendingCapture(prev => prev ? {
+      ...prev,
+      auto: {
+        ...prev.auto,
+        removeLabel: t('toolbar.removeCommand', { what }),
+        remove: [
+          `Remover este elemento (já escondido na tela pelo designer): ${what}.`,
+          'Tire o elemento do JSX. Se ele vem de uma lista gerada por .map, remova este item dos dados (ou filtre só ele), não o template de todos — a menos que o Scope diga ALL.',
+          'Limpe imports, props, estado e estilos que ficarem sem uso. Não simule com CSS (display:none, hidden, opacity).',
+        ].join('\n'),
+      },
+    } : null);
+    pushDraftStep({ kind: 'gesture', key: 'remove', label: t('undo.remove') });
+  }, []);
+
+  // Delete / Backspace removes the selected element, like in a design tool —
+  // never while typing. The note takes focus as soon as the card opens, so an
+  // empty note counts as "not typing": there is nothing in it to delete.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.key !== 'Delete' && e.key !== 'Backspace') || e.metaKey || e.ctrlKey || e.altKey) return;
+      const el = e.target as HTMLElement | null;
+      const emptyNote = el?.hasAttribute('data-ilse-note') && !el.textContent;
+      if (el && !emptyNote && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))) return;
+      if (!pendingCaptureRef.current || pendingCaptureRef.current.markerType !== 'element') return;
+      e.preventDefault();
+      removeSelected();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [removeSelected]);
+
   /** Take back one of Ilse's commands (× on its chip, or ⌘Z in the draft): its preview goes away, the card stays */
   const takeBack = useCallback((key: AutoKey) => {
+    // Retyped text: the panel puts the original back (and clears the command)
+    if (key === 'text') { panelHistoryRef.current?.resetText(); return; }
+    if (key === 'remove') {
+      const id = pendingCaptureRef.current?.pixelTargetId;
+      if (id) unhide(id);
+      setPendingCapture(prev => prev ? { ...prev, auto: { ...prev.auto, remove: undefined, removeLabel: undefined } } : null);
+      return;
+    }
     // Panel edits: remount the panel, which reverts its preview and starts clean
     if (key === 'style') setPanelEpoch(n => n + 1);
     // Move / resize / reorder: put the element back. The selection and
@@ -2523,6 +2634,12 @@ export function IlseToolbar({ demoMode, demoEndpoint }: { demoMode?: boolean; de
   const removeAnnotation = useCallback((index: number) => {
     const gone = annotationsRef.current[index];
     if (gone?.pixelTargetId) settleElement(document.querySelector(`[data-ilse-pixel-target="${gone.pixelTargetId}"]`));
+    // Never sent: nothing will make its preview real, so it goes (panel edits, text, removal)
+    if (gone?.pixelTargetId && gone.status === 'pending') {
+      previewReverts.current.get(gone.pixelTargetId)?.();
+      unhide(gone.pixelTargetId);
+    }
+    if (gone?.pixelTargetId) previewReverts.current.delete(gone.pixelTargetId);
     setAnnotations(prev => prev.filter((_, i) => i !== index));
     if (activeMarker === index) setActiveMarker(null);
   }, [activeMarker]);
@@ -2631,6 +2748,12 @@ export function IlseToolbar({ demoMode, demoEndpoint }: { demoMode?: boolean; de
 
   const handleClear = () => {
     if (clearConfirm) {
+      // Unsent drafts take their on-screen previews with them
+      for (const a of annotationsRef.current) {
+        if (!a.pixelTargetId) continue;
+        if (a.status === 'pending') { previewReverts.current.get(a.pixelTargetId)?.(); unhide(a.pixelTargetId); }
+        previewReverts.current.delete(a.pixelTargetId);
+      }
       setAnnotations([]);
       setActiveMarker(null);
       setClearConfirm(false);
@@ -2763,7 +2886,7 @@ export function IlseToolbar({ demoMode, demoEndpoint }: { demoMode?: boolean; de
     setAnnotating(false);
     setDrawMode(false);
     setStrokes([]);
-    setPendingCapture(null);
+    if (pendingCaptureRef.current) cancelCapture();
     setActiveMarker(null);
     setShowSettings(false);
     setChatOpen(false);
@@ -2787,6 +2910,7 @@ export function IlseToolbar({ demoMode, demoEndpoint }: { demoMode?: boolean; de
       <style>{`
         [data-ilse-toolbar] .ilse-hidden-scroll::-webkit-scrollbar { width: 0; height: 0; }
         [data-ilse-toolbar] .ilse-hidden-scroll { scrollbar-width: none; -ms-overflow-style: none; }
+        [data-ilse-toolbar] .ilse-panel-remove:not(:disabled):hover { background: ${color.muted} !important; color: ${color.destructive} !important; }
         [data-ilse-toolbar] [contenteditable][data-placeholder]:empty::before {
           content: attr(data-placeholder);
           color: #9ca3af;
@@ -3137,6 +3261,14 @@ export function IlseToolbar({ demoMode, demoEndpoint }: { demoMode?: boolean; de
         <PropertyPanel
           key={panelEpoch}
           historyRef={panelHistoryRef}
+          onRemove={pendingCapture.markerType === 'element' ? removeSelected : undefined}
+          removed={!!pendingCapture.auto?.remove}
+          textEdit={pendingCapture.textEdit}
+          onTextChange={(edit) => setPendingCapture(prev => prev ? {
+            ...prev,
+            textEdit: edit,
+            auto: { ...prev.auto, ...textCommand(edit) },
+          } : null)}
           onStep={() => pushDraftStep({ kind: 'panel' })}
           styles={pendingCapture.capture.styles}
           targetId={pendingCapture.pixelTargetId}
@@ -4490,7 +4622,7 @@ export function IlseToolbar({ demoMode, demoEndpoint }: { demoMode?: boolean; de
                 onClick={() => {
                   if (drawMode) { exitDrawMode(); return; }
                   setAnnotating(false);
-                  setPendingCapture(null);
+                  if (pendingCaptureRef.current) cancelCapture();
                   setActiveMarker(null);
                   setDrawMode(true);
                 }}

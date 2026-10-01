@@ -15,7 +15,9 @@
 
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { radius, color, shadow, font } from './tokens.js';
+import { radius, color, shadow, font, ilse } from './tokens.js';
+import { useFrontLayer } from './front-layer.js';
+import { t } from '../i18n/index.js';
 import { getDSTokens, type DSToken } from './analyze.js';
 import { readColor, canonicalColor, toHex, isTransparent } from './color.js';
 import { collectColorTokens, withStaticTokens, byBaseness, type ColorToken } from './color-tokens.js';
@@ -86,6 +88,14 @@ const GROUP_LABELS: Record<Group, string> = {
   appearance: 'Appearance',
 };
 
+/** Space between the panel's sections (Layout, Typography…) */
+const GROUP_GAP = 18;
+const groupTitle = {
+  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+  fontSize: 9, textTransform: 'uppercase', letterSpacing: '0.06em',
+  color: color.mutedForeground, marginBottom: 6,
+} as const;
+
 const COLOR_PROPS = new Set(['color', 'backgroundColor', 'borderColor']);
 
 // ── Value helpers ──────────────────────────────────────────────────────────
@@ -143,9 +153,25 @@ function matchToken(value: string, tokens: DSToken[], isColor: boolean, preferre
 // ── Panel ──────────────────────────────────────────────────────────────────
 
 /** Handle the toolbar keeps to step the panel back (⌘Z while a draft is open) */
-export interface PanelHistory { undo: () => string | undefined; size: () => number }
+export interface PanelHistory {
+  undo: () => string | undefined;
+  size: () => number;
+  resetText: () => void;
+  /** The preview outlives the panel (the draft was added): how to put the page back later */
+  detachPreview: () => () => void;
+}
 
-export function PropertyPanel({ styles, targetId, textSelection, contextLabel, committedRef, onChange, onPickerOpen, onClose, historyRef, onStep }: {
+export interface TextEdit { from: string; to: string }
+
+export function PropertyPanel({ styles, targetId, textSelection, contextLabel, committedRef, onChange, onPickerOpen, onClose, historyRef, onStep, onRemove, removed, textEdit, onTextChange }: {
+  /** The text already retyped in this draft — a remounted panel picks it up again */
+  textEdit?: TextEdit;
+  /** The element's text was retyped (undefined: back to what it was) */
+  onTextChange?: (edit: TextEdit | undefined) => void;
+  /** Remove the element (preview: hidden; the agent takes it out of the JSX) */
+  onRemove?: () => void;
+  /** Already marked for removal — the command's × in the card takes it back */
+  removed?: boolean;
   /** Filled by the panel: undo its last edit */
   historyRef?: { current: PanelHistory | null };
   /** An edit worth one ⌘Z happened (label: what changed) */
@@ -175,6 +201,32 @@ export function PropertyPanel({ styles, targetId, textSelection, contextLabel, c
   // Which token each colour edit came from, when it came from one
   const editTokens = useRef<Record<string, string>>({});
   const originalInline = useRef<Record<string, string>>({});
+
+  // ── Text: retyped in place. The preview writes into the element's own text
+  // nodes — React keeps pointing at them, so its next render simply wins. ──
+  // `from` comes from the draft when there is one: a remounted panel renders
+  // before the old one has put the original text back.
+  const [textOriginal] = useState(() => textEdit?.from ?? getElement()?.textContent ?? '');
+  const [text, setText] = useState(textEdit?.to ?? textOriginal);
+  const textRef = useRef(text);
+  const textNodes = useRef<Array<{ node: Text; data: string }> | null>(null);
+  function previewText(value: string) {
+    const e = getElement();
+    if (!e) return;
+    textNodes.current ??= Array.from(e.childNodes).filter((n): n is Text => n.nodeType === Node.TEXT_NODE).map(node => ({ node, data: node.data }));
+    textNodes.current.forEach((n, i) => { n.node.data = i === 0 ? value : ''; });
+  }
+  function revertText() { textNodes.current?.forEach(n => { n.node.data = n.data; }); }
+  function setTextValue(value: string) {
+    setText(value);
+    textRef.current = value;
+    if (value === textOriginal) revertText(); else previewText(value);
+    onTextChange?.(value === textOriginal ? undefined : { from: textOriginal, to: value });
+  }
+  useEffect(() => {
+    if (textEdit && textEdit.to !== textOriginal) previewText(textEdit.to);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Colour tokens resolved against the element itself — its theme, its scope.
   // Re-read whenever the picker opens, so a theme toggle mid-edit is picked up.
@@ -243,6 +295,7 @@ export function PropertyPanel({ styles, targetId, textSelection, contextLabel, c
   useEffect(() => {
     return () => {
       if (committedRef?.current) return;
+      revertText();
       const el = getElement();
       if (!el) return;
       for (const [prop, original] of Object.entries(originalInline.current)) {
@@ -326,11 +379,11 @@ export function PropertyPanel({ styles, targetId, textSelection, contextLabel, c
 
   // ── History: one step per decision, so ⌘Z walks the draft back ──
   // A colour drag or a stream of the same control within half a second is one step.
-  const history = useRef<Array<{ edits: Record<string, string>; tokens: Record<string, string>; label: string; at: number }>>([]);
+  const history = useRef<Array<{ edits: Record<string, string>; tokens: Record<string, string>; text: string; label: string; at: number }>>([]);
   function record(label: string) {
     const last = history.current[history.current.length - 1];
     if (last && last.label === label && Date.now() - last.at < 500) { last.at = Date.now(); return; }
-    history.current.push({ edits: { ...editsRef.current }, tokens: { ...editTokens.current }, label, at: Date.now() });
+    history.current.push({ edits: { ...editsRef.current }, tokens: { ...editTokens.current }, text: textRef.current, label, at: Date.now() });
     onStep?.(label);
   }
   function undo(): string | undefined {
@@ -344,9 +397,22 @@ export function PropertyPanel({ styles, targetId, textSelection, contextLabel, c
       const picked = tokenName ? colorTokens.find(tk => tk.name === tokenName) : undefined;
       apply(spec, snap.edits[key] ?? '', picked);
     }
+    if (snap.text !== textRef.current) setTextValue(snap.text);
     return snap.label;
   }
-  if (historyRef) historyRef.current = { undo, size: () => history.current.length };
+  function detachPreview() {
+    const styles = { ...originalInline.current };
+    const texts = [...(textNodes.current ?? [])];
+    return () => {
+      const e = getElement();
+      if (e) for (const [prop, original] of Object.entries(styles)) {
+        e.style.setProperty(prop.replace(/[A-Z]/g, m => `-${m.toLowerCase()}`), original || null);
+      }
+      texts.forEach(n => { n.node.data = n.data; });
+    };
+  }
+  if (historyRef) historyRef.current = { undo, size: () => history.current.length, resetText: () => setTextValue(textOriginal), detachPreview };
+  const [front, bringToFront] = useFrontLayer('panel', false);
 
   function applyMany(values: Record<string, string>, label = PROPS.find(p => p.key === Object.keys(values)[0])?.label ?? 'Layout') {
     record(label);
@@ -361,6 +427,8 @@ export function PropertyPanel({ styles, targetId, textSelection, contextLabel, c
     <div
       ref={panelRef}
       data-ilse-toolbar
+      data-ilse-panel
+      onMouseDownCapture={bringToFront}
       onClick={(e) => e.stopPropagation()}
       onMouseDown={(e) => e.stopPropagation()}
       style={{
@@ -373,7 +441,7 @@ export function PropertyPanel({ styles, targetId, textSelection, contextLabel, c
         borderRadius: radius.xl,
         boxShadow: shadow.xl,
         fontFamily: font.sans,
-        zIndex: 99998,
+        zIndex: front ? 99999 : 99998,
         overflow: 'hidden',
       }}
     >
@@ -396,7 +464,7 @@ export function PropertyPanel({ styles, targetId, textSelection, contextLabel, c
           <div style={{ fontSize: 9, color: color.mutedForeground, marginTop: 1 }}>
             {(() => {
               const all = [...dsTokens.filter(t => t.type !== 'color'), ...colorTokens];
-              return all.length > 0 ? `${all.length} tokens · ${countByType(all)}` : 'sem design context — rode ilse init';
+              return all.length > 0 ? `${all.length} tokens · ${countByType(all)}` : t('panel.noTokens');
             })()}
           </div>
         </div>
@@ -421,14 +489,28 @@ export function PropertyPanel({ styles, targetId, textSelection, contextLabel, c
         )}
       </div>
 
-      <div style={{ padding: '8px 12px 12px', overflowY: 'auto', fontSize: 11 }}>
-        {groups.map(({ group, specs }) => (
-          <div key={group} style={{ marginBottom: 10 }}>
-            <div style={{
-              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-              fontSize: 9, textTransform: 'uppercase', letterSpacing: '0.06em',
-              color: color.mutedForeground, marginBottom: 5,
-            }}>
+      <div style={{ padding: '10px 12px 12px', overflowY: 'auto', fontSize: 11 }}>
+        {isText && !textSelection && el && (
+          <div style={{ marginBottom: GROUP_GAP }}>
+            <div style={groupTitle}>Text</div>
+            <textarea
+              value={text}
+              onChange={(e) => { record('Texto'); setTextValue(e.target.value); }}
+              rows={Math.min(4, Math.max(1, Math.ceil(text.length / 34)))}
+              spellCheck
+              style={{
+                width: '100%', boxSizing: 'border-box', resize: 'none', display: 'block',
+                fontSize: 11, fontFamily: font.sans, lineHeight: 1.4,
+                padding: '4px 6px', borderRadius: radius.sm,
+                border: `1px solid ${text !== textOriginal ? '#E8A33D' : color.border}`,
+                backgroundColor: color.background, color: color.foreground, outline: 'none',
+              }}
+            />
+          </div>
+        )}
+        {groups.map(({ group, specs }, gi) => (
+          <div key={group} style={{ marginBottom: gi === groups.length - 1 ? 0 : GROUP_GAP }}>
+            <div style={groupTitle}>
               {GROUP_LABELS[group]}
               {group === 'stroke' && (
                 <IconButton
@@ -510,6 +592,29 @@ export function PropertyPanel({ styles, targetId, textSelection, contextLabel, c
           </div>
         ))}
       </div>
+
+      {onRemove && (
+        <div style={{ borderTop: `1px solid ${color.border}`, padding: 8 }}>
+          <button
+            onClick={onRemove}
+            disabled={removed}
+            title={removed ? t('panel.removed') : t('panel.removeHint')}
+            className="ilse-panel-remove"
+            style={{
+              width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+              padding: '6px 8px', borderRadius: radius.md, border: 'none',
+              background: 'none', fontSize: 11, fontFamily: font.sans,
+              color: removed ? ilse.brand : color.mutedForeground,
+              cursor: removed ? 'default' : 'pointer',
+            }}
+          >
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M2.5 4h11M6 4V2.5h4V4M4 4l.7 9.5h6.6L12 4M6.5 6.5v4.5M9.5 6.5v4.5" />
+            </svg>
+            {removed ? t('panel.removedShort') : t('panel.remove')}
+          </button>
+        </div>
+      )}
 
       {picker && (() => {
         const spec = PROPS.find(p => p.key === picker.key)!;
