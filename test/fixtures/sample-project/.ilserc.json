@@ -1,0 +1,11 @@
+{
+  "dsSource": { "type": "file", "path": "./tokens.json" },
+  "include": ["src/**/*.tsx"],
+  "exclude": ["node_modules/**"],
+  "ai": { "mode": "ilse" },
+  "preferences": {
+    "autoFix": "review",
+    "groupBy": "severity",
+    "verbosity": "normal"
+  }
+}

@@ -1,0 +1,94 @@
+{
+  "name": "ilse-design",
+  "version": "0.5.0-beta.0",
+  "description": "Visual feedback for code agents. Show what to change. Your agent builds it.",
+  "keywords": [
+    "design",
+    "visual-feedback",
+    "claude-code",
+    "codex",
+    "cursor",
+    "mcp",
+    "react",
+    "tailwind",
+    "ai-agent",
+    "devtools"
+  ],
+  "author": "Iverson Dantas",
+  "homepage": "https://github.com/idantas/ilse#readme",
+  "bugs": {
+    "url": "https://github.com/idantas/ilse/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/idantas/ilse.git"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/cli/index.d.ts",
+      "import": "./dist/cli/index.js"
+    },
+    "./react": {
+      "types": "./dist/react/index.d.ts",
+      "import": "./dist/react/index.js"
+    }
+  },
+  "bin": {
+    "ilse": "dist/cli/index.js",
+    "ilse-design": "dist/cli/index.js",
+    "ilse-mcp": "dist/mcp/server.js"
+  },
+  "peerDependencies": {
+    "react": ">=18.0.0"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "build": "tsc && npm run build:toolbar",
+    "postbuild": "chmod +x dist/cli/index.js dist/mcp/server.js",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build:toolbar": "esbuild src/standalone/mount.tsx --bundle --format=iife --minify --jsx=automatic --define:process.env.NODE_ENV='\"production\"' --outfile=dist/standalone/toolbar.js --log-level=warning",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "@babel/parser": "^7.26.3",
+    "@babel/traverse": "^7.26.4",
+    "@babel/types": "^7.26.3",
+    "@clack/prompts": "^1.2.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@tabler/icons-react": "^3.41.1",
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "dotenv": "^17.4.0",
+    "glob": "^11.0.0",
+    "openai": "^4.77.0",
+    "ws": "^8.20.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/babel__traverse": "^7.20.6",
+    "@types/node": "^22.10.2",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@types/ws": "^8.18.1",
+    "esbuild": "^0.28.2",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.5",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -1,0 +1,46 @@
+# Publica no npm quando um Release é publicado no GitHub.
+#
+# A versão vem da tag do release (v0.5.0-beta.1 → 0.5.0-beta.1), então não é
+# preciso editar o package.json à mão. Versão com "-" (beta, rc) sai na dist-tag
+# "next"; sem "-", vira a "latest" que todo mundo recebe.
+#
+# Autenticação: npm Trusted Publishing (OIDC) — sem token guardado em secret.
+# Configuração única em npmjs.com → ilse-design → Settings → Trusted Publisher:
+# GitHub Actions, repositório idantas/ilse, workflow publish.yml.
+
+name: Publish to npm
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write   # OIDC pro npm Trusted Publishing
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      # Trusted Publishing precisa do npm 11.5.1+
+      - run: npm install -g npm@latest
+
+      - name: Versão a partir da tag do release
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          if [[ "$VERSION" == *-* ]]; then echo "tag=next" >> "$GITHUB_OUTPUT"; else echo "tag=latest" >> "$GITHUB_OUTPUT"; fi
+
+      # npm ci roda o "prepare", que já faz o build (tsc + bundle da toolbar)
+      - run: npm ci
+      - run: npm test
+
+      - run: npm publish --tag ${{ steps.version.outputs.tag }}
