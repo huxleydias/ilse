@@ -47,12 +47,25 @@ function tryPort(port: number) {
   let helloTimer: ReturnType<typeof setTimeout> | null = null;
   let handshakeDone = false;
 
+  // Each socket moves the scan on at most once. An attempt can fail on several
+  // paths for the same socket — open then error (some proxies accept the TCP
+  // connection first), open then a 4003 close, and the handshake timer after
+  // either — and moving on from each one doubled the sockets at every port:
+  // thousands of them by 4757.
+  let movedOn = false;
+  const moveOn = () => {
+    if (movedOn) return;
+    movedOn = true;
+    if (helloTimer) { clearTimeout(helloTimer); helloTimer = null; }
+    tryPort(port + 1);
+  };
+
   sock.onopen = () => {
     helloTimer = setTimeout(() => {
       if (!handshakeDone) {
         sock.close();
         if (ws === sock) ws = null;
-        tryPort(port + 1);
+        moveOn();
       }
     }, 1500);
   };
@@ -72,10 +85,9 @@ function tryPort(port: number) {
           emitStatus(true);
         } else {
           // Wrong server — skip to next port
-          if (helloTimer) { clearTimeout(helloTimer); helloTimer = null; }
           sock.close();
           if (ws === sock) ws = null;
-          tryPort(port + 1);
+          moveOn();
           return;
         }
       }
@@ -87,7 +99,7 @@ function tryPort(port: number) {
   sock.onclose = (e) => {
     if (e.code === 4003) {
       // Server rejected us — wrong project. Try next port immediately.
-      tryPort(port + 1);
+      moveOn();
       return;
     }
     // Only clear module-level ws if it still points at THIS instance.
@@ -101,10 +113,11 @@ function tryPort(port: number) {
   };
 
   sock.onerror = () => {
+    // A live connection that fails reconnects through onclose, which follows
+    if (handshakeDone) return;
     // Connection refused or error — try next port without waiting
     sock.close();
-    if (ws === sock) ws = null;
-    tryPort(port + 1);
+    moveOn();
   };
 }
 
