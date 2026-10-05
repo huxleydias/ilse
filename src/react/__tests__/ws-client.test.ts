@@ -71,6 +71,14 @@ describe('ws-client port scan', () => {
     expect(FakeSocket.created).toEqual([4747, 4748, 4749]);
   });
 
+  it('starts at the port the serving ilse named', async () => {
+    vi.stubGlobal('window', { __ilseBridgePort: 4750 });
+    FakeSocket.behavior = (port, s) => (port === 4750 ? (s.open(), s.hello()) : s.fail());
+    client.connect();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(FakeSocket.created).toEqual([4750]);
+  });
+
   it('reconnects to the same port when a live connection drops', async () => {
     let live: FakeSocket | null = null;
     FakeSocket.behavior = (port, s) => {

@@ -12,11 +12,25 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let shouldReconnect = true;
 let confirmedPort: number | null = null; // port that accepted our origin
 
+declare global {
+  interface Window { __ilseBridgePort?: number }
+}
+
 function emitStatus(connected: boolean) {
   for (const l of statusListeners) l(connected);
 }
 
-export function connect(startPort = BASE_PORT) {
+/**
+ * The `ilse` that served this bundle says its port in the first line
+ * (proxy/toolbar.ts). Starting there keeps a page loaded through the Vite
+ * plugin, bookmarklet or extension off another project's server on 4747.
+ */
+function firstPort(): number {
+  const hint = typeof window !== 'undefined' ? window.__ilseBridgePort : undefined;
+  return typeof hint === 'number' && hint >= BASE_PORT && hint <= MAX_PORT ? hint : BASE_PORT;
+}
+
+export function connect(startPort = firstPort()) {
   // Revive auto-reconnect in case a previous disconnect disabled it
   // (React Strict Mode double-mount runs cleanup then effect again).
   shouldReconnect = true;
@@ -28,7 +42,7 @@ function tryPort(port: number) {
   if (!shouldReconnect) return;
   if (port > MAX_PORT) {
     // All ports tried — wait and retry from the beginning
-    scheduleReconnect(BASE_PORT);
+    scheduleReconnect(firstPort());
     return;
   }
 
@@ -108,7 +122,7 @@ function tryPort(port: number) {
     if (ws === sock) {
       ws = null;
       emitStatus(false);
-      if (shouldReconnect) scheduleReconnect(confirmedPort ?? BASE_PORT);
+      if (shouldReconnect) scheduleReconnect(confirmedPort ?? firstPort());
     }
   };
 
